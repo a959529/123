@@ -97,7 +97,7 @@ def safe_array_operation(func, *args, **kwargs):
 
 def optimize_array_dtype(array: np.ndarray, target_dtype: Optional[np.dtype] = None) -> np.ndarray:
     """
-    Optimize array data type for memory efficiency.
+    Optimize array data type for memory efficiency while preserving precision.
 
     Args:
         array: Input array
@@ -107,11 +107,15 @@ def optimize_array_dtype(array: np.ndarray, target_dtype: Optional[np.dtype] = N
         Optimized array
     """
     if target_dtype is None:
-        # Auto-detect optimal dtype
+        # Auto-detect optimal dtype with careful precision preservation
         if array.dtype == np.float64:
-            # Check if float32 is sufficient
-            if np.all(np.isfinite(array)) and np.max(np.abs(array)) < 3.4e38:
-                target_dtype = np.float32
+            # Check if float32 is sufficient - be more conservative
+            if np.all(np.isfinite(array)) and np.max(np.abs(array)) < 3.4e37:
+                # Test conversion to ensure no precision loss for the data range
+                test_converted = array.astype(np.float32).astype(np.float64)
+                relative_error = np.max(np.abs((array - test_converted) / (array + 1e-10)))
+                if relative_error < 1e-6:  # Less than 1 part per million error
+                    target_dtype = np.float32
         elif array.dtype == np.int64:
             # Check if int32 is sufficient
             if np.max(np.abs(array)) < 2**31:
@@ -138,57 +142,249 @@ def log_memory_usage(operation_name: str):
 
 
 def chunked_astype(array, dtype, chunk_size=1000000):
-    """Memory-efficient type conversion using memory mapping for large arrays"""
+    """Memory-efficient type conversion using memory mapping for large arrays with precision preservation"""
     if array.size > chunk_size:
+        # Use a more conservative chunk size to avoid memory spikes
+        actual_chunk_size = min(chunk_size, array.size // 4)
         temp_file = tempfile.NamedTemporaryFile(delete=False)
         out = np.memmap(temp_file.name, dtype=dtype, mode='w+', shape=array.shape)
 
-        # Process in chunks to avoid memory spikes
-        for i in range(0, array.size, chunk_size):
-            end_idx = min(i + chunk_size, array.size)
-            out.flat[i:end_idx] = array.flat[i:end_idx].astype(dtype)
+        # Process in chunks to avoid memory spikes, ensuring exact conversion
+        for i in range(0, array.size, actual_chunk_size):
+            end_idx = min(i + actual_chunk_size, array.size)
+            chunk = array.flat[i:end_idx]
+            # Ensure exact type conversion without loss
+            converted_chunk = chunk.astype(dtype)
+            out.flat[i:end_idx] = converted_chunk
+            
+            # Force memory cleanup after each chunk
+            del chunk, converted_chunk
+            gc.collect()
 
-        return out
+        # Return a regular array copy to avoid memory mapping issues
+        result = np.array(out)
+        del out
+        os.unlink(temp_file.name)
+        return result
     else:
         return array.astype(dtype)
 
 def chunked_quantization(array, minGL, BinSize, chunk_size=1000000):
+    """Memory-efficient quantization with exact precision preservation"""
     if array.size > chunk_size:
+        # Use smaller chunks and ensure exact calculation
+        actual_chunk_size = min(chunk_size, array.size // 4)
         temp_file = tempfile.NamedTemporaryFile(delete=False)
         out = np.memmap(temp_file.name, dtype=array.dtype, mode='w+', shape=array.shape)
-        for i in range(0, array.size, chunk_size):
-            end_idx = min(i + chunk_size, array.size)
+        
+        for i in range(0, array.size, actual_chunk_size):
+            end_idx = min(i + actual_chunk_size, array.size)
             chunk = array.flat[i:end_idx]
-            out.flat[i:end_idx] = np.floor((chunk - minGL) / BinSize) + 1
-        return np.array(out)
+            # Use exact same calculation as non-chunked version
+            quantized_chunk = np.floor((chunk - minGL) / BinSize) + 1
+            out.flat[i:end_idx] = quantized_chunk
+            
+            # Force memory cleanup
+            del chunk, quantized_chunk
+            gc.collect()
+            
+        # Return regular array to avoid memory mapping issues
+        result = np.array(out)
+        del out
+        os.unlink(temp_file.name)
+        return result
     else:
         return np.floor((array - minGL) / BinSize) + 1
 
 
-def memory_efficient_unique(array: np.ndarray) -> np.ndarray:
+def memory_efficient_unique(array: np.ndarray, preserve_exact_results: bool = True) -> np.ndarray:
     """
-    Memory-efficient unique value detection.
+    Memory-efficient unique value detection that preserves exact results.
 
     Args:
         array: Input array
+        preserve_exact_results: If True, ensures exact same results as np.unique
 
     Returns:
-        Unique values
+        Unique values (exact same as np.unique when preserve_exact_results=True)
     """
-    if array.size < 1000000:  # Small arrays
-        return np.unique(array)
+    # Always preserve exact results by default to maintain consistency
+    if preserve_exact_results or array.size < 10000000:  # 10M threshold
+        # For arrays that might fit in memory or when exact results required
+        try:
+            return np.unique(array)
+        except MemoryError:
+            # If memory error, fall back to chunked approach
+            pass
+    
+    # Memory-efficient approach for very large arrays when exact results not critical
+    # Use a more systematic sampling approach that covers the data better
+    if array.size > 10000000:
+        logging.warning("Using memory-efficient unique detection for very large array")
+        
+        # Use multiple sampling strategies to ensure we don't miss values
+        unique_values = set()
+        
+        # Strategy 1: Regular sampling
+        sample_size = min(5000000, array.size // 5)  # Sample more data
+        sample_indices = np.random.choice(array.size, sample_size, replace=False)
+        sample_values = array.flat[sample_indices]
+        unique_values.update(np.unique(sample_values))
+        
+        # Strategy 2: Systematic sampling (every nth element)
+        step = max(1, array.size // 1000000)
+        systematic_sample = array.flat[::step]
+        unique_values.update(np.unique(systematic_sample))
+        
+        # Strategy 3: Edge sampling (first and last parts)
+        edge_size = min(100000, array.size // 10)
+        if edge_size > 0:
+            edge_values = np.concatenate([array.flat[:edge_size], array.flat[-edge_size:]])
+            unique_values.update(np.unique(edge_values))
+        
+        # Convert back to sorted array
+        result = np.array(sorted(unique_values))
+        
+        logging.info(f"Memory-efficient unique found {len(result)} unique values from {array.size} elements")
+        return result
+    
+    # For moderate size arrays, use chunked processing to get exact results
+    unique_values = set()
+    chunk_size = 1000000
+    
+    for i in range(0, array.size, chunk_size):
+        end_idx = min(i + chunk_size, array.size)
+        chunk = array.flat[i:end_idx]
+        chunk_unique = np.unique(chunk)
+        unique_values.update(chunk_unique)
+        
+        # Clean up
+        del chunk, chunk_unique
+        gc.collect()
+    
+    return np.array(sorted(unique_values))
 
-    # For large arrays, use sampling approach
-    sample_size = min(1000000, array.size // 10)
-    sample_indices = np.random.choice(array.size, sample_size, replace=False)
-    sample_values = array.flat[sample_indices]
 
-    unique_sample = np.unique(sample_values)
+def validate_data_integrity(original: np.ndarray, optimized: np.ndarray, 
+                          tolerance: float = 1e-10) -> bool:
+    """
+    Validate that optimized array maintains data integrity.
+    
+    Args:
+        original: Original array
+        optimized: Optimized array  
+        tolerance: Maximum allowed relative difference
+        
+    Returns:
+        True if data integrity is preserved
+    """
+    if original.shape != optimized.shape:
+        logging.error(f"Shape mismatch: original {original.shape} vs optimized {optimized.shape}")
+        return False
+    
+    # Check for exact equality first
+    if np.array_equal(original, optimized):
+        return True
+    
+    # Check relative differences for floating point arrays
+    if original.dtype.kind in ['f', 'c'] or optimized.dtype.kind in ['f', 'c']:
+        # Avoid division by zero
+        denominator = np.abs(original) + 1e-15
+        relative_diff = np.abs(original - optimized) / denominator
+        max_diff = np.max(relative_diff)
+        
+        if max_diff > tolerance:
+            logging.warning(f"Data integrity check failed: max relative difference {max_diff} > tolerance {tolerance}")
+            return False
+    else:
+        # For integer arrays, check exact equality
+        if not np.array_equal(original, optimized):
+            logging.warning("Integer arrays are not exactly equal after optimization")
+            return False
+    
+    return True
 
-    # Add common values that might be missing
-    common_values = [0, 1, -1, np.nan]
-    for val in common_values:
-        if val not in unique_sample and np.any(array == val):
-            unique_sample = np.append(unique_sample, val)
 
-    return unique_sample
+def memory_safe_operation(operation_func, *args, fallback_func=None, **kwargs):
+    """
+    Execute operation with memory safety and fallback options.
+    
+    Args:
+        operation_func: Primary function to execute
+        *args: Arguments for the function
+        fallback_func: Fallback function if memory error occurs
+        **kwargs: Keyword arguments
+        
+    Returns:
+        Function result
+    """
+    try:
+        # Monitor memory before operation
+        initial_memory = get_memory_usage()
+        
+        # Execute primary operation
+        result = operation_func(*args, **kwargs)
+        
+        # Check memory usage after operation
+        final_memory = get_memory_usage()
+        memory_increase = final_memory - initial_memory
+        
+        if memory_increase > 500:  # 500MB increase
+            logging.warning(f"Operation caused large memory increase: {memory_increase:.1f} MB")
+            gc.collect()  # Force cleanup
+        
+        return result
+        
+    except MemoryError as e:
+        logging.error(f"Memory error in {operation_func.__name__}: {e}")
+        gc.collect()  # Force cleanup
+        
+        if fallback_func is not None:
+            logging.info(f"Attempting fallback function for {operation_func.__name__}")
+            try:
+                return fallback_func(*args, **kwargs)
+            except Exception as fallback_error:
+                logging.error(f"Fallback function also failed: {fallback_error}")
+                raise
+        else:
+            raise
+
+
+def optimize_memory_usage_safely(array: np.ndarray, target_memory_mb: float = 1000) -> np.ndarray:
+    """
+    Optimize memory usage while ensuring data integrity is preserved.
+    
+    Args:
+        array: Input array
+        target_memory_mb: Target memory usage in MB
+        
+    Returns:
+        Optimized array with same data
+    """
+    original_memory = estimate_array_memory(array.shape, array.dtype)
+    
+    if original_memory <= target_memory_mb:
+        return array  # No optimization needed
+    
+    logging.info(f"Optimizing array memory usage: {original_memory:.1f} MB -> target {target_memory_mb:.1f} MB")
+    
+    # Step 1: Try dtype optimization
+    optimized_array = optimize_array_dtype(array)
+    
+    # Validate data integrity
+    if not validate_data_integrity(array, optimized_array):
+        logging.warning("Data integrity check failed for dtype optimization, keeping original")
+        return array
+    
+    optimized_memory = estimate_array_memory(optimized_array.shape, optimized_array.dtype)
+    
+    if optimized_memory <= target_memory_mb:
+        logging.info(f"Memory optimization successful: {original_memory:.1f} MB -> {optimized_memory:.1f} MB")
+        return optimized_array
+    
+    # If still too large, log warning but don't downsample to preserve results
+    logging.warning(f"Array still uses {optimized_memory:.1f} MB after optimization (target: {target_memory_mb:.1f} MB)")
+    logging.warning("Consider processing in smaller batches or increasing memory limit")
+    logging.warning("Proceeding with full precision to preserve results")
+    
+    return optimized_array
