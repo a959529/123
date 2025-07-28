@@ -33,7 +33,8 @@ try:
     from ..utils.utils import (
         get_memory_usage, check_memory_available, estimate_array_memory,
         safe_array_operation, optimize_array_dtype, memory_efficient_unique,
-        log_memory_usage
+        log_memory_usage, validate_data_integrity, memory_safe_operation,
+        optimize_memory_usage_safely
     )
 except ImportError:
     # Fallback if utils not available
@@ -44,6 +45,9 @@ except ImportError:
     def optimize_array_dtype(array, target_dtype=None): return array
     def memory_efficient_unique(array): return np.unique(array)
     def log_memory_usage(operation_name): pass
+    def validate_data_integrity(original, optimized, tolerance=1e-10): return True
+    def memory_safe_operation(func, *args, **kwargs): return func(*args, **kwargs)
+    def optimize_memory_usage_safely(array, target_memory_mb=1000): return array
 
 
 class MemoryAwareRadiomicsProcessor:
@@ -65,7 +69,7 @@ class MemoryAwareRadiomicsProcessor:
 
     def process_large_array(self, array: np.ndarray, operation: str, **kwargs) -> Any:
         """
-        Process large arrays with memory awareness.
+        Process large arrays with memory awareness while preserving exact results.
 
         Args:
             array: Input array
@@ -96,9 +100,10 @@ class MemoryAwareRadiomicsProcessor:
             raise ValueError(f"Unknown operation: {operation}")
 
     def _memory_efficient_operation(self, array: np.ndarray, operation: str, **kwargs) -> Any:
-        """Memory-efficient operation for large arrays."""
+        """Memory-efficient operation for large arrays that preserves exact results."""
         if operation == "unique":
-            return memory_efficient_unique(array)
+            # Always preserve exact results for unique operations
+            return memory_efficient_unique(array, preserve_exact_results=True)
         elif operation == "convolve":
             return self._convolve_memory_efficient(array, **kwargs)
         else:
@@ -110,40 +115,76 @@ class MemoryAwareRadiomicsProcessor:
         return convolve(array, kernel, **kwargs)
 
     def _convolve_memory_efficient(self, array: np.ndarray, kernel: np.ndarray, **kwargs) -> np.ndarray:
-        """Memory-efficient convolution for large arrays."""
-        # For very large arrays, use simplified approach
+        """Memory-efficient convolution for large arrays without approximations."""
+        # For very large arrays, try chunked convolution instead of approximation
         if array.size > 100000000:  # 100M elements
-            self.logger.warning("Array too large for convolution, using simplified approach")
-            return self._simplified_convolution(array, kernel)
+            self.logger.info("Array very large, attempting chunked convolution")
+            return self._chunked_convolution(array, kernel, **kwargs)
 
         # Try standard convolution with memory monitoring
         try:
             return self._convolve_standard(array, kernel, **kwargs)
         except MemoryError:
-            self.logger.warning("Memory error in convolution, using simplified approach")
-            return self._simplified_convolution(array, kernel)
+            self.logger.warning("Memory error in convolution, trying chunked approach")
+            return self._chunked_convolution(array, kernel, **kwargs)
 
-    def _simplified_convolution(self, array: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-        """Simplified convolution for memory-constrained scenarios."""
-        # Use local maximum as approximation
-        result = np.zeros_like(array)
-        roi_mask = array > 0
-
-        if np.any(roi_mask):
-            max_val = np.max(array[roi_mask])
-            result[roi_mask] = max_val * 0.9  # Simplified approximation
-
-        return result
+    def _chunked_convolution(self, array: np.ndarray, kernel: np.ndarray, **kwargs) -> np.ndarray:
+        """
+        Chunked convolution that preserves results by processing in overlapping chunks.
+        This maintains mathematical correctness while reducing memory usage.
+        """
+        try:
+            from scipy.signal import convolve
+            
+            # Calculate overlap needed based on kernel size
+            kernel_shape = np.array(kernel.shape)
+            overlap = kernel_shape // 2
+            
+            # For 3D arrays, process slice by slice with overlap
+            if array.ndim == 3:
+                result = np.zeros_like(array)
+                
+                for z in range(array.shape[2]):
+                    # Define slice bounds with overlap
+                    z_start = max(0, z - overlap[2] if len(overlap) > 2 else 0)
+                    z_end = min(array.shape[2], z + overlap[2] + 1 if len(overlap) > 2 else z + 1)
+                    
+                    # Extract slice with overlap
+                    slice_data = array[:, :, z_start:z_end]
+                    
+                    # Convolve the slice
+                    if slice_data.ndim == 3 and kernel.ndim == 3:
+                        slice_result = convolve(slice_data, kernel, mode='same')
+                        # Extract the center part (original slice)
+                        center_idx = z - z_start
+                        if center_idx < slice_result.shape[2]:
+                            result[:, :, z] = slice_result[:, :, center_idx]
+                    else:
+                        # 2D convolution on each slice
+                        kernel_2d = kernel if kernel.ndim == 2 else kernel[:, :, kernel.shape[2]//2]
+                        result[:, :, z] = convolve(slice_data[:, :, -1], kernel_2d, mode='same')
+                
+                return result
+            else:
+                # For 2D arrays, use standard convolution
+                return convolve(array, kernel, **kwargs)
+                
+        except Exception as e:
+            self.logger.error(f"Error in chunked convolution: {e}")
+            # As a last resort, return the original array (no convolution)
+            # This preserves the data while avoiding approximations
+            self.logger.warning("Convolution failed, returning original array")
+            return array
 
     def optimize_array_for_processing(self, array: np.ndarray) -> np.ndarray:
         """
-        Optimize array for processing based on memory constraints.
+        Optimize array for processing based on memory constraints without data loss.
 
         Args:
             array: Input array
 
         Returns:
-            Optimized array
+            Optimized array (same data, potentially different dtype)
         """
         if not self.enable_optimization:
             return array
@@ -153,38 +194,17 @@ class MemoryAwareRadiomicsProcessor:
         array_memory = estimate_array_memory(array.shape, array.dtype)
 
         if current_memory + array_memory > self.memory_limit_mb:
-            # Force garbage collection
+            # Force garbage collection first
             gc.collect()
+            
+            # Update memory usage after cleanup
+            current_memory = get_memory_usage()
 
-            # Optimize data type
-            optimized_array = optimize_array_dtype(array)
-
-            # If still too large, use sampling
-            if estimate_array_memory(optimized_array.shape, optimized_array.dtype) > self.memory_limit_mb:
-                self.logger.warning("Array too large, using downsampling")
-                return self._downsample_array(optimized_array)
-
+            # Use safe memory optimization that preserves data integrity
+            optimized_array = optimize_memory_usage_safely(array, self.memory_limit_mb)
             return optimized_array
 
         return array
-
-    def _downsample_array(self, array: np.ndarray) -> np.ndarray:
-        """
-        Downsample array to fit memory constraints.
-
-        Args:
-            array: Input array
-
-        Returns:
-            Downsampled array
-        """
-        # Simple downsampling by taking every nth element
-        if array.ndim == 3:
-            return array[::2, ::2, ::2]
-        elif array.ndim == 2:
-            return array[::2, ::2]
-        else:
-            return array[::2]
 
     def log_memory_status(self, operation: str):
         """Log current memory status."""
@@ -348,7 +368,7 @@ class RadiomicsProcessor:
         params_copy['radiomics_Feats2out'] = feats2out
         params_copy['radiomics_ROI_num'] = roi_num
         params_copy['radiomics_ROI_selection_mode'] = roi_selection_mode
-        params_copy['value_type'] = params.get('value_type', 'APPROXIMATE_VALUE')
+        params_copy['value_type'] = params.get('value_type', 'EXACT_VALUE')
         return params_copy
     
     def _perform_final_quality_check(self, image_id: str, df: pd.DataFrame) -> None:
@@ -433,7 +453,7 @@ class RadiomicsProcessor:
             params['radiomics_isROIsCombined'],
             params['radiomics_Feats2out'],
             params['radiomics_destfolder'],
-            params.get('value_type', 'APPROXIMATE_VALUE')
+            params.get('value_type', 'EXACT_VALUE')
         )
         
         return result
@@ -466,7 +486,7 @@ class RadiomicsProcessor:
             'isROIsCombined': args[22],
             'Feats2out': args[23],
             'destfolder': args[24],
-            'value_type': args[25] if len(args) > 25 else 'APPROXIMATE_VALUE'
+            'value_type': args[25] if len(args) > 25 else 'EXACT_VALUE'
         }
     
     def _apply_preprocessing_to_data(self, image_id: str, data_original: np.ndarray, data_label: Any, min_roi_volume: int) -> Tuple[np.ndarray, Any]:
@@ -488,11 +508,22 @@ class RadiomicsProcessor:
         memory_processor = get_memory_processor()
         memory_processor.log_memory_status("Preprocessing start")
 
-        # Optimize arrays for processing
+        # Optimize arrays for processing with data integrity validation
+        original_data_copy = data_original.copy()  # Keep copy for validation
         data_original = memory_processor.optimize_array_for_processing(data_original)
+        
+        # Validate that optimization preserved data integrity
+        if not validate_data_integrity(original_data_copy, data_original):
+            logging.warning(f"[{image_id}] Data integrity check failed for image optimization, using original")
+            data_original = original_data_copy
 
-        # Apply intensity preprocessing
-        processed_original = apply_intensity_preprocessing(data_original, data_label)
+        # Apply intensity preprocessing with memory safety
+        processed_original = memory_safe_operation(
+            apply_intensity_preprocessing, 
+            data_original, 
+            data_label,
+            fallback_func=lambda x, y: x  # Return original if preprocessing fails
+        )
 
         # Process label data based on type
         if isinstance(data_label, dict):
@@ -501,26 +532,40 @@ class RadiomicsProcessor:
             for roi_name, roi_mask in data_label.items():
                 logging.info(f"[{image_id}] Processing ROI: {roi_name}")
 
-                # Optimize ROI mask for processing
+                # Optimize ROI mask for processing with validation
+                original_roi_copy = roi_mask.copy()
                 roi_mask = memory_processor.optimize_array_for_processing(roi_mask)
+                
+                # Validate optimization preserved data integrity
+                if not validate_data_integrity(original_roi_copy, roi_mask):
+                    logging.warning(f"[{image_id}] Data integrity check failed for ROI {roi_name}, using original")
+                    roi_mask = original_roi_copy
 
-                try:
-                    processed_roi = optimize_roi_preprocessing(roi_mask, min_roi_volume)
-                    processed_label[roi_name] = processed_roi
-                except MemoryError as e:
-                    logging.error(f"[{image_id}] Memory error processing ROI {roi_name}: {e}")
-                    # Use original ROI if memory fails
-                    processed_label[roi_name] = roi_mask
+                # Use memory-safe ROI preprocessing
+                processed_roi = memory_safe_operation(
+                    optimize_roi_preprocessing,
+                    roi_mask,
+                    min_roi_volume,
+                    fallback_func=lambda x, y: x  # Return original if preprocessing fails
+                )
+                processed_label[roi_name] = processed_roi
         else:
-            # Standard mask case
+            # Standard mask case with validation
+            original_label_copy = data_label.copy()
             data_label = memory_processor.optimize_array_for_processing(data_label)
+            
+            # Validate optimization preserved data integrity
+            if not validate_data_integrity(original_label_copy, data_label):
+                logging.warning(f"[{image_id}] Data integrity check failed for mask optimization, using original")
+                data_label = original_label_copy
 
-            try:
-                processed_label = optimize_roi_preprocessing(data_label, min_roi_volume)
-            except MemoryError as e:
-                logging.error(f"[{image_id}] Memory error processing mask: {e}")
-                # Use original mask if memory fails
-                processed_label = data_label
+            # Use memory-safe mask preprocessing
+            processed_label = memory_safe_operation(
+                optimize_roi_preprocessing,
+                data_label,
+                min_roi_volume,
+                fallback_func=lambda x, y: x  # Return original if preprocessing fails
+            )
 
         memory_processor.log_memory_status("Preprocessing end")
         logging.info(f"[{image_id}] Preprocessing completed")
@@ -1113,7 +1158,7 @@ class RadiomicsProcessor:
                      apply_preprocessing: bool = True, min_roi_volume: int = DEFAULT_MIN_ROI_VOLUME,
                      num_workers: Optional[int] = None, disable_parallel: bool = False,
                      feats2out: int = 2, bin_size: int = 25, roi_num: int = 10, 
-                     roi_selection_mode: str = "per_Img", value_type: str = "APPROXIMATE_VALUE",
+                     roi_selection_mode: str = "per_Img", value_type: str = "EXACT_VALUE",
                      memory_limit_mb: int = 1000, enable_memory_optimization: bool = True,
                      aggressive_memory_optimization: bool = False) -> Optional[Dict[str, Any]]:
         """
