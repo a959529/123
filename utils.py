@@ -142,12 +142,46 @@ def log_memory_usage(operation_name: str):
 
 
 def chunked_astype(array, dtype, chunk_size=1000000):
-    """Memory-efficient type conversion using memory mapping for large arrays with precision preservation"""
-    if array.size > chunk_size:
-        # Use a more conservative chunk size to avoid memory spikes
-        actual_chunk_size = min(chunk_size, array.size // 4)
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-        out = np.memmap(temp_file.name, dtype=dtype, mode='w+', shape=array.shape)
+    """Memory-efficient type conversion using memory mapping for large arrays with multiprocessing safety"""
+    # For arrays that are large but not extremely large, use in-memory chunking
+    if array.size > chunk_size and array.size < 50000000:  # 50M threshold for in-memory processing
+        return _chunked_astype_in_memory(array, dtype, chunk_size)
+    elif array.size > chunk_size:
+        return _chunked_astype_with_tempfile(array, dtype, chunk_size)
+    else:
+        return array.astype(dtype)
+
+
+def _chunked_astype_in_memory(array, dtype, chunk_size):
+    """In-memory chunked type conversion to avoid file conflicts in multiprocessing."""
+    actual_chunk_size = min(chunk_size, array.size // 4)
+    
+    # Pre-allocate result array
+    result = np.empty(array.shape, dtype=dtype)
+    
+    # Process in chunks
+    for i in range(0, array.size, actual_chunk_size):
+        end_idx = min(i + actual_chunk_size, array.size)
+        chunk = array.flat[i:end_idx]
+        converted_chunk = chunk.astype(dtype)
+        result.flat[i:end_idx] = converted_chunk
+        
+        # Force memory cleanup after each chunk
+        del chunk, converted_chunk
+        gc.collect()
+    
+    return result
+
+
+def _chunked_astype_with_tempfile(array, dtype, chunk_size):
+    """File-based chunked type conversion with multiprocessing safety."""
+    actual_chunk_size = min(chunk_size, array.size // 4)
+    
+    # Create process-safe temporary file
+    _, temp_filename = create_process_safe_tempfile("chunked_astype", ".tmp")
+    
+    try:
+        out = np.memmap(temp_filename, dtype=dtype, mode='w+', shape=array.shape)
 
         # Process in chunks to avoid memory spikes, ensuring exact conversion
         for i in range(0, array.size, actual_chunk_size):
@@ -163,19 +197,66 @@ def chunked_astype(array, dtype, chunk_size=1000000):
 
         # Return a regular array copy to avoid memory mapping issues
         result = np.array(out)
+        
+        # Properly close and delete the memory map
         del out
-        os.unlink(temp_file.name)
+        gc.collect()
+        
+        # Safe file deletion with retry mechanism
+        _safe_delete_temp_file(temp_filename)
+        
         return result
-    else:
-        return array.astype(dtype)
+        
+    except Exception as e:
+        # Ensure cleanup even if error occurs
+        try:
+            _safe_delete_temp_file(temp_filename)
+        except:
+            pass
+        raise e
+
 
 def chunked_quantization(array, minGL, BinSize, chunk_size=1000000):
-    """Memory-efficient quantization with exact precision preservation"""
-    if array.size > chunk_size:
-        # Use smaller chunks and ensure exact calculation
-        actual_chunk_size = min(chunk_size, array.size // 4)
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-        out = np.memmap(temp_file.name, dtype=array.dtype, mode='w+', shape=array.shape)
+    """Memory-efficient quantization with exact precision preservation and multiprocessing safety"""
+    # For arrays that are large but not extremely large, use in-memory chunking
+    if array.size > chunk_size and array.size < 50000000:  # 50M threshold for in-memory processing
+        return _chunked_quantization_in_memory(array, minGL, BinSize, chunk_size)
+    elif array.size > chunk_size:
+        return _chunked_quantization_with_tempfile(array, minGL, BinSize, chunk_size)
+    else:
+        return np.floor((array - minGL) / BinSize) + 1
+
+
+def _chunked_quantization_in_memory(array, minGL, BinSize, chunk_size):
+    """In-memory chunked quantization to avoid file conflicts in multiprocessing."""
+    actual_chunk_size = min(chunk_size, array.size // 4)
+    
+    # Pre-allocate result array
+    result = np.empty(array.shape, dtype=array.dtype)
+    
+    # Process in chunks
+    for i in range(0, array.size, actual_chunk_size):
+        end_idx = min(i + actual_chunk_size, array.size)
+        chunk = array.flat[i:end_idx]
+        quantized_chunk = np.floor((chunk - minGL) / BinSize) + 1
+        result.flat[i:end_idx] = quantized_chunk
+        
+        # Force memory cleanup
+        del chunk, quantized_chunk
+        gc.collect()
+    
+    return result
+
+
+def _chunked_quantization_with_tempfile(array, minGL, BinSize, chunk_size):
+    """File-based chunked quantization with multiprocessing safety."""
+    actual_chunk_size = min(chunk_size, array.size // 4)
+    
+    # Create process-safe temporary file
+    _, temp_filename = create_process_safe_tempfile("chunked_quant", ".tmp")
+    
+    try:
+        out = np.memmap(temp_filename, dtype=array.dtype, mode='w+', shape=array.shape)
         
         for i in range(0, array.size, actual_chunk_size):
             end_idx = min(i + actual_chunk_size, array.size)
@@ -190,11 +271,68 @@ def chunked_quantization(array, minGL, BinSize, chunk_size=1000000):
             
         # Return regular array to avoid memory mapping issues
         result = np.array(out)
+        
+        # Properly close and delete the memory map
         del out
-        os.unlink(temp_file.name)
+        gc.collect()
+        
+        # Safe file deletion with retry mechanism
+        _safe_delete_temp_file(temp_filename)
+        
         return result
-    else:
-        return np.floor((array - minGL) / BinSize) + 1
+        
+    except Exception as e:
+        # Ensure cleanup even if error occurs
+        try:
+            _safe_delete_temp_file(temp_filename)
+        except:
+            pass
+        raise e
+
+
+def _safe_delete_temp_file(filename: str, max_retries: int = 5, delay: float = 0.1):
+    """
+    Safely delete temporary file with retry mechanism for Windows multiprocessing.
+    
+    Args:
+        filename: Path to temporary file
+        max_retries: Maximum number of deletion attempts
+        delay: Delay between attempts in seconds
+    """
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            if os.path.exists(filename):
+                # Force garbage collection before deletion
+                gc.collect()
+                time.sleep(delay)  # Small delay to ensure file handles are released
+                os.unlink(filename)
+                return  # Success
+        except (PermissionError, OSError) as e:
+            if attempt < max_retries - 1:
+                # Wait longer on each retry
+                time.sleep(delay * (attempt + 1))
+                continue
+            else:
+                # On final attempt, log warning but don't raise exception
+                logging.warning(f"Could not delete temporary file {filename} after {max_retries} attempts: {e}")
+                logging.warning("File will be cleaned up by OS eventually")
+                # Register for cleanup at exit as last resort
+                try:
+                    import atexit
+                    atexit.register(lambda: _cleanup_file_at_exit(filename))
+                except:
+                    pass
+
+
+def _cleanup_file_at_exit(filename: str):
+    """Cleanup temporary file at program exit."""
+    try:
+        if os.path.exists(filename):
+            os.unlink(filename)
+    except:
+        pass  # Silent cleanup at exit
 
 
 def memory_efficient_unique(array: np.ndarray, preserve_exact_results: bool = True) -> np.ndarray:
@@ -388,3 +526,62 @@ def optimize_memory_usage_safely(array: np.ndarray, target_memory_mb: float = 10
     logging.warning("Proceeding with full precision to preserve results")
     
     return optimized_array
+
+
+def get_process_safe_temp_dir():
+    """
+    Get a process-safe temporary directory for multiprocessing.
+    
+    Returns:
+        Path to process-safe temporary directory
+    """
+    import uuid
+    base_temp_dir = tempfile.gettempdir()
+    process_temp_dir = os.path.join(
+        base_temp_dir, 
+        f"radiomics_proc_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    )
+    
+    # Create directory if it doesn't exist
+    os.makedirs(process_temp_dir, exist_ok=True)
+    
+    # Register for cleanup at exit
+    import atexit
+    atexit.register(lambda: _cleanup_temp_dir(process_temp_dir))
+    
+    return process_temp_dir
+
+
+def _cleanup_temp_dir(temp_dir):
+    """Clean up temporary directory at exit."""
+    try:
+        import shutil
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    except:
+        pass  # Silent cleanup
+
+
+def create_process_safe_tempfile(prefix="temp", suffix=".tmp"):
+    """
+    Create a process-safe temporary file that won't conflict with other processes.
+    
+    Args:
+        prefix: File prefix
+        suffix: File suffix
+        
+    Returns:
+        Tuple of (file_handle, filename)
+    """
+    import uuid
+    temp_dir = get_process_safe_temp_dir()
+    filename = os.path.join(
+        temp_dir,
+        f"{prefix}_{os.getpid()}_{uuid.uuid4().hex[:8]}{suffix}"
+    )
+    
+    # Create and immediately close the file
+    with open(filename, 'wb') as f:
+        pass
+    
+    return None, filename
